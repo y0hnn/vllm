@@ -294,6 +294,7 @@ def test_speculative_splitk_bf16_query_fp8_kv(monkeypatch):
         block_size=128,
         num_blocks=64,
         seq_threshold_3D=16,
+        kv_dtype=FP8_DTYPE,
     )
     assert len(reduce_grids) == 1
 
@@ -797,10 +798,12 @@ def test_triton_unified_attn(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+# 512: Gemma 4's global layers, whose FP8 KV tiles need the narrower SM8x tile.
+@pytest.mark.parametrize("head_size", HEAD_SIZES + [512])
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("seq_threshold_3D", SEQ_THRESHOLD_3D_VALUES)
+@pytest.mark.parametrize("kv_dtype", [FP8_DTYPE, torch.float8_e5m2])
 @torch.inference_mode()
 def test_triton_unified_attn_bf16_query_fp8_kv(
     seq_lens: list[tuple[int, int]],
@@ -809,8 +812,18 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
     block_size: int,
     num_blocks: int,
     seq_threshold_3D: int,
+    kv_dtype: torch.dtype,
 ) -> None:
-    """Test bf16 Q with FP8 per-tensor KV cache (dequant via _cast_kv_tile)."""
+    """Test bf16 Q with FP8 per-tensor KV cache (dequant via _cast_kv_tile).
+
+    e5m2 needs no FP8 hardware to convert, so it runs from SM80; e4m3 (fp8e4nv)
+    needs SM89."""
+    if (
+        current_platform.is_cuda()
+        and kv_dtype != torch.float8_e5m2
+        and not current_platform.has_device_capability(89)
+    ):
+        pytest.skip("e4m3 KV needs SM89+")
     torch.set_default_device(DEVICE_TYPE)
     set_random_seed(0)
 
@@ -834,8 +847,8 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
 
     k_scale = torch.tensor(0.5, dtype=torch.float32)
     v_scale = torch.tensor(0.25, dtype=torch.float32)
-    fp8_key_cache = (key_cache / k_scale).to(FP8_DTYPE)
-    fp8_value_cache = (value_cache / v_scale).to(FP8_DTYPE)
+    fp8_key_cache = (key_cache / k_scale).to(kv_dtype)
+    fp8_value_cache = (value_cache / v_scale).to(kv_dtype)
 
     scale_shape = (num_seqs, num_kv_heads)
     k_descale = torch.full(scale_shape, k_scale.item(), dtype=torch.float32)
@@ -1058,7 +1071,7 @@ def _run_use_td_case(
 ) -> None:
     """Shared driver for the USE_TD test cases.
 
-    Runs ``unified_attention(..., use_td=True)`` and compares against the
+    Runs `unified_attention(..., use_td=True)` and compares against the
     reference paged-attention implementation that the sibling non-TD
     tests use.
     """
@@ -1169,12 +1182,12 @@ def test_triton_unified_attn_use_td(
 ) -> None:
     """Exercise the USE_TD (tensor-descriptor) Q/K/V load/store path.
 
-    Covers both 2D and 3D kernels via ``seq_threshold_3D``. Two routes
+    Covers both 2D and 3D kernels via `seq_threshold_3D`. Two routes
     to the USE_TD_QO=False fallback (pointer path for Q/O with TD still
     active for KV tile loads):
 
-    - non-pow2 ``num_queries_per_kv`` via ``NUM_HEADS`` entry ``(5, 1)``,
-    - non-pow2 ``head_size`` via ``HEAD_SIZES_USE_TD`` entry ``96``.
+    - non-pow2 `num_queries_per_kv` via `NUM_HEADS` entry `(5, 1)`,
+    - non-pow2 `head_size` via `HEAD_SIZES_USE_TD` entry `96`.
     """
     _run_use_td_case(
         seq_lens=seq_lens,
@@ -1198,12 +1211,12 @@ def test_triton_unified_attn_use_td(
 def test_triton_unified_attn_use_td_tile_clamp(
     num_heads: tuple[int, int],
 ) -> None:
-    """Regression guard: ``USE_TD`` needs ``BLOCK_SIZE % TILE_SIZE == 0``.
+    """Regression guard: `USE_TD` needs `BLOCK_SIZE % TILE_SIZE == 0`.
 
-    With ``block_size=16`` and ``head_size=128`` (non-Gemma3),
-    ``_get_tile_size`` returns 32 for prefill, which violates the
-    ``USE_TD`` constraint unless clamped to ``block_size``.  Without
-    the clamp the triton kernel ``static_assert`` fires at compile time.
+    With `block_size=16` and `head_size=128` (non-Gemma3),
+    `_get_tile_size` returns 32 for prefill, which violates the
+    `USE_TD` constraint unless clamped to `block_size`.  Without
+    the clamp the triton kernel `static_assert` fires at compile time.
     """
     _run_use_td_case(
         seq_lens=[(256, 256), (128, 128)],
@@ -1234,10 +1247,10 @@ def _softcap_probe_kernel(
 def test_softcap_does_not_overflow_on_large_scores() -> None:
     """Scores above ~88 * soft_cap must not overflow to inf/NaN.
 
-    The exp-based softcap computes ``(exp(y) - exp(-y)) / (exp(y) + exp(-y))``
-    with ``y = S / soft_cap``. For ``|y| > ~88`` the exponentials overflow to
-    ``inf`` and the ratio becomes ``inf / inf = NaN``, poisoning the whole
-    attention row. Gemma-2 style models use ``attn_logit_softcapping = 50``,
+    The exp-based softcap computes `(exp(y) - exp(-y)) / (exp(y) + exp(-y))`
+    with `y = S / soft_cap`. For `|y| > ~88` the exponentials overflow to
+    `inf` and the ratio becomes `inf / inf = NaN`, poisoning the whole
+    attention row. Gemma-2 style models use `attn_logit_softcapping = 50`,
     so scores above 4400 are in range for their large attention logits.
     """
     soft_cap = 50.0

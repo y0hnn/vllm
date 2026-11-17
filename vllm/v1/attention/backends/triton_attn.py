@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    kv_cache_fp8_dtype,
     triton_reshape_and_cache_flash,
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
@@ -170,7 +171,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         ):
             num_speculative_tokens = speculative_config.num_speculative_tokens or 0
             query_len = 1 + num_speculative_tokens * (
-                2 if speculative_config.parallel_drafting else 1
+                2 if speculative_config.speculator_config.parallel_drafting else 1
             )
             max_query_len_3d = min(query_len, MAX_3D_QUERY_LEN)
         # Scratch is indexed by query token, including verification tokens.
@@ -415,15 +416,15 @@ class TritonAttentionImpl(AttentionImpl):
         """Extract per-head scale views from the padded content dimension.
 
         The KV cache is packed as logical shape
-        ``(num_blocks, nkv, block_size, 2 * (hs + pad))`` where
-        ``pad = sizeof(float32) / sizeof(cache_dtype)``.  The content dim holds
-        ``[K(hs) | K_scale(pad) | V(hs) | V_scale(pad)]`` per (head, slot); the
-        last ``pad`` elements of each half hold one float32 scale.  We create
-        strided float32 views over those bytes.  ``kv_cache`` must be the
+        `(num_blocks, nkv, block_size, 2 * (hs + pad))` where
+        `pad = sizeof(float32) / sizeof(cache_dtype)`.  The content dim holds
+        `[K(hs) | K_scale(pad) | V(hs) | V_scale(pad)]` per (head, slot); the
+        last `pad` elements of each half hold one float32 scale.  We create
+        strided float32 views over those bytes.  `kv_cache` must be the
         packed logical tensor (call before any transpose), but may have HND or
         NHD physical strides.
 
-        Scale shape: ``(num_blocks, block_size, num_kv_heads)``
+        Scale shape: `(num_blocks, block_size, num_kv_heads)`
         """
         if self._k_scale_cache is not None:
             return
@@ -514,11 +515,18 @@ class TritonAttentionImpl(AttentionImpl):
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
-            if self.kv_cache_dtype.startswith("fp8") and not (
-                current_platform.has_device_capability(89)
+            e5m2_ok = self.kv_cache_dtype == "fp8_e5m2" and (
+                current_platform.has_device_capability(80)
+            )
+            if (
+                self.kv_cache_dtype.startswith("fp8")
+                and not e5m2_ok
+                and not current_platform.has_device_capability(89)
             ):
                 suggested = (
-                    "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"
+                    "float16"
+                    if (cap is None or cap.to_int() < 80)
+                    else "fp8_e5m2 (or bfloat16)"
                 )
                 raise ValueError(
                     f"FP8 KV cache is not supported by the Triton attention backend "
@@ -542,7 +550,7 @@ class TritonAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.attn_type = attn_type
-        self.fp8_dtype = current_platform.fp8_dtype()
+        self.fp8_dtype = kv_cache_fp8_dtype(kv_cache_dtype)
 
         self.sinks = sinks
         if sinks is not None:
@@ -553,7 +561,11 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
+        # FP8 query quantization targets e4m3, which an e5m2 cache does not match.
+        self.supports_quant_query_input = (
+            current_platform.is_cuda()
+            and self.fp8_dtype == current_platform.fp8_dtype()
+        )
         if current_platform.is_rocm():
             # Enable GPUs with fp8 MMA support
             from vllm.platforms.rocm import on_gfx11, on_gfx90a
@@ -562,6 +574,16 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            from vllm.v1.attention.ops.int4_per_token_head import init_rht_signs
+
+            init_rht_signs(
+                head_size,
+                torch.device(
+                    current_platform.device_type,
+                    torch.accelerator.current_device_index(),
+                ),
+            )
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel XPU).  The dead branch
@@ -780,7 +802,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         # Use encoder-specific metadata for sequence information
         query_start_loc = attn_metadata.query_start_loc
-        seq_lens = attn_metadata.seq_lens
+        # No KV cache: K/V length is the query length, not seq_lens.
+        seq_lens = query_start_loc[1:] - query_start_loc[:-1]
         max_query_len = attn_metadata.max_query_len
 
         # Call flash attention directly on Q, K, V tensors
